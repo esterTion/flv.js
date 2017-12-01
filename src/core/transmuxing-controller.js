@@ -333,6 +333,16 @@ class TransmuxingController {
         Object.setPrototypeOf(segmentInfo, MediaInfo.prototype);
         this._mediaInfo.segments[this._currentSegmentIndex] = segmentInfo;
 
+        //Update segment duration if accurateDuration is give (mp4)
+        if (mediaInfo.accurateDuration != undefined) {
+            let currentSegment = this._mediaDataSource.segments[this._currentSegmentIndex];
+            let deltaDuration = mediaInfo.accurateDuration - currentSegment.duration;
+            currentSegment.duration = mediaInfo.accurateDuration;
+            for (let i = this._currentSegmentIndex + 1; i < this._mediaDataSource.segments.length; i++) {
+                this._mediaDataSource.segments[i].timestampBase += deltaDuration;
+            }
+        }
+
         // notify mediaInfo update
         this._reportSegmentMediaInfo(this._currentSegmentIndex);
 

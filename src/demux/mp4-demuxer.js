@@ -652,6 +652,7 @@ class MP4Demuxer {
         let sampleTsMap = {};
         let codecs = [];
         let id = 1;
+        let accurateDuration = [0];
         if (mediaInfo.hasVideo) {
             let sps = tracks.video.mdia[0].minf[0].stbl[0].stsd[0].avc1.extensions.avcC.SPS[0];
             mediaInfo.videoCodec = sps.codecString;
@@ -680,6 +681,8 @@ class MP4Demuxer {
                     sampleNumber++;
                 }
             }
+            let lastSample = sampleTsMap.video[sampleTsMap.video.length - 1];
+            accurateDuration.push(Math.ceil((lastSample.ts + lastSample.duration) / timeScale * 1e3));
             let ctts = tracks.video.mdia[0].minf[0].stbl[0].ctts;
             let stss = tracks.video.mdia[0].minf[0].stbl[0].stss;
             let currentChunkRule = stsc[0];
@@ -793,6 +796,8 @@ class MP4Demuxer {
                     sampleNumber++;
                 }
             }
+            let lastSample = sampleTsMap.audio[sampleTsMap.audio.length - 1];
+            accurateDuration.push(Math.ceil((lastSample.ts + lastSample.duration) / timeScale * 1e3));
             let currentChunkRule = stsc[0];
             let nextChunkRule = stsc[1];
             let sampleToChunkOffset = 0;
@@ -835,6 +840,7 @@ class MP4Demuxer {
             this._audioInitialMetadataDispatched = true;
             this._audioMetadata = meta;
         }
+        mediaInfo.accurateDuration = Math.max.apply(null, accurateDuration);
         if (codecs.length > 0) {
             mediaInfo.mimeType += '; codecs="' + codecs.join(',') + '"';
         }
