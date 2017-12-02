@@ -1018,7 +1018,8 @@ class MP4Demuxer {
                 
                 let sample;
                 for (let i = 0; i < dataChunk.samples.length; i++) {
-                    if (sampleOffset == 0) {
+                    if (sampleOffset <= 0) {
+                        offset -= sampleOffset;
                         sample = dataChunk.samples[i];
                         break;
                     }
