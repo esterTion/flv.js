@@ -705,6 +705,7 @@ class MP4Demuxer {
                     type: 'video',
                     samples: []
                 };
+                let endset = currentChunk.offset;
                 for (let j = 0, sampleOffset = 0; j < currentChunkRule.samplesPerChunk; j++) {
                     if (currentCtsLeft == 0) {
                         currentCtsRule = ctts[++cttsOffset];
@@ -722,6 +723,7 @@ class MP4Demuxer {
                         size,
                         isKeyframe
                     });
+                    endset += size;
 
                     if (isKeyframe) {
                         keyframesIndex.times.push(this._timestampBase + ts / timeScale * 1e3);
@@ -729,6 +731,7 @@ class MP4Demuxer {
                     }
                     sampleOffset += size;
                 }
+                currentChunk.endset = endset;
                 chunkMap.push(currentChunk);
                 chunkNumber++;
             }
@@ -814,13 +817,16 @@ class MP4Demuxer {
                     type: 'audio',
                     samples: []
                 };
+                let endset = currentChunk.offset;
                 for (let j = 0; j < currentChunkRule.samplesPerChunk; j++) {
                     currentChunk.samples.push({
                         ts: sampleTsMap.audio[sampleNumber].ts,
                         duration: sampleTsMap.audio[sampleNumber].duration,
                         size: stsz[sampleNumber++]
                     });
+                    endset += size;
                 }
+                currentChunk.endset = endset;
                 chunkMap.push(currentChunk);
                 chunkNumber++;
             }
@@ -861,8 +867,9 @@ class MP4Demuxer {
         });
         this._chunkMap = chunkMap;
         this._mediaInfo = mediaInfo;
-        if (mediaInfo.isComplete())
+        if (mediaInfo.isComplete()) {
             this._onMediaInfo(mediaInfo);
+        }
         Log.v(this.TAG, 'Parsed moov box, hasVideo: ' + mediaInfo.hasVideo + ' hasAudio: ' + mediaInfo.hasAudio);
     }
 
@@ -995,16 +1002,20 @@ class MP4Demuxer {
                 //find the chunk
                 let sampleOffset = byteStart + offset;
                 let dataChunk = chunkMap[0];
-                for (let i = 1; i < chunkMap.length; i++) {
-                    dataChunk = chunkMap[i];
-                    if (sampleOffset < dataChunk.offset) {
-                        dataChunk = chunkMap[i - 1];
+                for (let i = 0; i < chunkMap.length; i++) {
+                    if (sampleOffset < chunkMap[i].offset && sampleOffset < dataChunk.endset) {
                         break;
                     }
+                    dataChunk = chunkMap[i];
                 }
 
                 //find out which sample
                 sampleOffset -= dataChunk.offset;
+                if (sampleOffset < 0) {
+                    offset -= sampleOffset;
+                    sampleOffset = 0;
+                }
+                
                 let sample;
                 for (let i = 0; i < dataChunk.samples.length; i++) {
                     if (sampleOffset == 0) {
