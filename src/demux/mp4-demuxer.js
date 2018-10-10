@@ -151,6 +151,11 @@ class MP4Demuxer {
         this._dispatch = false;
         this._mdatEnd = 0;
 
+        // cache next demux start position 
+        this._lastChunkOffet = 0;
+        this._lastSampleIndex = 0;
+        this._proccessedByte = -1;// init with nonzero for search method run first time when mdat comes with byteStart eqaul to zero
+
         this._hasAudio = probeData.hasAudioTrack;
         this._hasVideo = probeData.hasVideoTrack;
 
@@ -742,6 +747,12 @@ class MP4Demuxer {
             mediaInfo.hasKeyframesIndex = true;
             mediaInfo.keyframesIndex = keyframesIndex;
 
+            this._naluLengthSize = tracks.video.mdia[0].minf[0].stbl[0].stsd[0].avc1.extensions.avcC.lengthSizeMinusOne + 1;
+            if (this._naluLengthSize !== 3 && this._naluLengthSize !== 4) {
+                this._onError(DemuxErrors.FORMAT_ERROR, `Mp4: Strange NaluLengthSizeMinusOne: ${this._naluLengthSize - 1}`);
+                return;
+            }
+
             let meta = {};
             meta.avcc = tracks.video.mdia[0].minf[0].stbl[0].stsd[0].avc1.extensions.avcC.data;
             meta.bitDepth = sps.bit_depth;
@@ -959,6 +970,7 @@ class MP4Demuxer {
         let offset = 0;
         let le = this._littleEndian;
 
+        this._dispatch = false;
         if (byteStart === 0) {  // buffer with header
             let probeData = MP4Demuxer.probe(chunk);
             offset = probeData.dataOffset;
@@ -967,9 +979,8 @@ class MP4Demuxer {
             }
         }
 
-
         if (this._firstParse) {  // parse moov box
-            this._firstParse = false;
+            
             if (byteStart + offset !== this._dataOffset) {
                 Log.w(this.TAG, 'First time parsing but chunk byteStart invalid!');
             }
@@ -978,121 +989,144 @@ class MP4Demuxer {
             let moov = boxInfo(uintarr, offset);
             //moov still not finished, wait for it
             if (!moov.fullyLoaded) {
-                this._firstParse = true;
                 return 0;
             }
             let moovData = new Uint8Array(chunk, byteStart + offset, moov.size);
             this._parseMoov(moovData);
             offset += moov.size;
+            this._firstParse = false;
+
         }
 
-        let chunkOffset;
-
-        while (offset < chunk.byteLength) {
-            this._dispatch = true;
-
+        //try parse 'mdat' box
+        while (this._mdatEnd === 0) {
             let v = new Uint8Array(chunk, offset);
+            let box = boxInfo(v, 0);
+            if (box.name == 'mdat') {
+                this._mdatEnd = byteStart + offset + box.size;
+                offset += box.headSize;
+            } else {
+                if (box.fullyLoaded) {
+                    //not mdat box, skip
+                    offset += box.size;
+                } else {
+                    //not mdat box, not fully loaded, return
+                    this._proccessedByte = byteStart + offset;
+                    return offset;
+                }
+            }
+        }
 
-            if (offset + 8 > chunk.byteLength) {
-                // data not enough for parsing box size
-                break;
+        //mdat data ended just skip left bytes
+        if (byteStart + offset >= this._mdatEnd) {
+            this._proccessedByte = byteStart + chunk.byteLength;
+            return chunk.byteLength;
+        }
+
+        let chunkMap = this._chunkMap;
+        let sampleOffset = byteStart + offset;
+
+        let chunkOffset = -1;
+        let sampleIndex = -1;
+        let dataChunk = null;
+        if (this._proccessedByte != byteStart) {// seek or some unexpected situation happen should recaculate 
+            let bottom = this._proccessedByte < byteStart ? this._lastChunkOffet : 0;
+            let top = this._proccessedByte > byteStart ? this._lastChunkOffet : chunkMap.length;
+            // bi search first chunk
+            chunkOffset = (function (bottom, top) {
+                while (bottom <= top) {
+                    let mid = Math.floor((bottom + top) / 2);
+                    let result = (function (mid) {
+                        if (sampleOffset < chunkMap[mid].offset) return -1;
+                        if (chunkMap[mid + 1] && sampleOffset >= chunkMap[mid + 1].offset) return 1;
+                        return 0;
+                    })(mid);
+                    if (result == 0) return mid;
+                    if (result < 0) top = mid - 1;
+                    else bottom = mid + 1;
+                }
+                return -1;
+            })(bottom, top);
+
+            dataChunk = chunkMap[chunkOffset]; 
+            
+            if (!dataChunk) {
+                throw new IllegalStateException(`search first chunk fail for sampleOffset ${sampleOffset} get chunkOffset ${chunkOffset}`);
             }
 
-            let chunkMap = this._chunkMap;
-            if (this._mdatEnd > byteStart + offset) {
-                //find the chunk
-                let sampleOffset = byteStart + offset;
-                let dataChunk = null;
-                if (chunkOffset === undefined) {
-                    // bi search first chunk
-                    chunkOffset = (function () {
-                        let bottom = 0, top = chunkMap.length - 1;
-                        while (bottom <= top) {
-                            let mid = Math.floor((bottom + top) / 2);
-                            let result = (function (mid) {
-                                if (sampleOffset < chunkMap[mid].offset) return -1;
-                                if (chunkMap[mid + 1] && sampleOffset >= chunkMap[mid + 1].offset) return 1;
-                                return 0;
-                            })(mid);
-                            if (result == 0) return mid;
-                            if (result < 0) top = mid - 1;
-                            else bottom = mid + 1;
-                        }
-                    })();
-                    dataChunk = chunkMap[chunkOffset];
+            //find sample index in target chunk
+            for (sampleOffset -= dataChunk.offset, sampleIndex = 0; sampleOffset > 0 && sampleIndex < dataChunk.samples.length;) {
+                sampleOffset -= dataChunk.samples[sampleIndex].size;
+                sampleIndex ++;
+            }
+            if (sampleOffset < 0 && sampleIndex < dataChunk.samples.length) {
+                // sampleOffset is not a sample's start position maybe a error but for now try to skip to next sample  
+                let skipBytes = -sampleOffset;
+                
+                if (offset + skipBytes <= chunk.byteLength) {
+                    offset += skipBytes;
+                    Log.w(this.TAG, `sampleOffset ${byteStart + offset} is not a sample's start position try skip ${skipBytes} bytes `
+                        + `make postion to chunk #${chunkOffset} (type: ${dataChunk.type}) with sampleIndex ${sampleIndex}`);
                 } else {
-                    // sequal search other chunk
-                    for (; chunkOffset < chunkMap.length; chunkOffset++) {
-                        dataChunk = chunkMap[chunkOffset];
-                        if (sampleOffset < dataChunk.offset) {
-                            dataChunk = chunkMap[chunkOffset - 1];
-                            break;
-                        }
-                    }
-                    if (!dataChunk) {
-                        dataChunk = chunkMap[chunkMap.length - 1];
-                    }
+                    // wait for next data come
+                    this._proccessedByte = byteStart + sampleOffset; //next time should search sampleIndex again so just set _proccessedByte less than byteStart
+                    return offset;
                 }
+            }
 
-                //find out which sample
-                sampleOffset -= dataChunk.offset;
-                let sample;
-                for (let i = 0; i < dataChunk.samples.length; i++) {
-                    if (sampleOffset == 0) {
-                        sample = dataChunk.samples[i];
-                        break;
-                    }
-                    sampleOffset -= dataChunk.samples[i].size;
+        } else {
+            chunkOffset = this._lastChunkOffet;
+            sampleIndex = this._lastSampleIndex;
+            dataChunk = chunkMap[chunkOffset];
+        }
+
+        while (offset < chunk.byteLength) {
+            for (let sample, sampleSize; sampleIndex < dataChunk.samples.length; sampleIndex++) {
+                sample = dataChunk.samples[sampleIndex];
+                sampleSize = sample.size;
+                if (offset + sampleSize > chunk.byteLength) {
+                    break;
                 }
-
-                if (sample === undefined) {
-                    //extra unused data, drop it
-                    let chunkOffset = chunkMap.indexOf(dataChunk);
-                    let nextChunk = chunkMap[chunkOffset + 1];
-                    let droppedBytes = (nextChunk != undefined ? nextChunk.offset : this._mdatEnd) - byteStart - offset;
-                    Log.w(this.TAG, `Found ${droppedBytes} bytes unused data in chunk #${chunkOffset} (type: ${dataChunk.type}), dropping. `);
-                    offset += droppedBytes;
-                    continue;
-                }
-
-                let sampleSize;
                 if (dataChunk.type == 'video') {
-                    sampleSize = sample.size;
-                    if (offset + sampleSize > chunk.byteLength) {
-                        break;
-                    }
                     this._parseAVCVideoData(chunk, offset, sampleSize, sample.ts, byteStart + offset, sample.isKeyframe, sample.cts, sample.duration);
                 } else if (dataChunk.type == 'audio') {
-                    sampleSize = sample.size;
-                    if (offset + sampleSize > chunk.byteLength) {
-                        break;
-                    }
                     let track = this._audioTrack;
                     let dts = this._timestampBase / 1e3 * this._audioMetadata.timescale + sample.ts;
-                    let accData = v.subarray(0, sampleSize);
+                    let accData = new Uint8Array(chunk, offset, sampleSize);
                     let aacSample = { unit: accData, length: accData.byteLength, dts: dts, pts: dts };
                     track.samples.push(aacSample);
                     track.length += aacSample.length;
                 }
+                offset  += sample.size;
+            }
 
-                offset += sampleSize;
+            if (sampleIndex < dataChunk.samples.length) {//data not enough for next sample
+                break;
+            }
+                
+            let nextChunk = chunkMap[chunkOffset + 1];
+            if (!nextChunk) {
+                // all samples are extracted just skip left bytes
+                offset = chunk.byteLength;
             } else {
-                let box = boxInfo(v, 0);
-                if (box.name == 'mdat') {
-                    this._mdatEnd = byteStart + offset + box.size - 8;
-                    offset += box.headSize;
-                } else {
-                    if (box.fullyLoaded) {
-                        //not mdat box, skip
-                        offset += box.size;
+                if (nextChunk.offset > byteStart + offset) {
+                    let droppedBytes = nextChunk.offset - byteStart - offset;
+                    if (offset + droppedBytes <= chunk.byteLength) {
+                        offset += droppedBytes;
+                        Log.w(this.TAG, `Found ${droppedBytes} bytes unused data in chunk #${chunkOffset} (type: ${dataChunk.type}), dropping. `);
                     } else {
-                        //not mdat box, not fully loaded, break out
+                        // wait for next chunk come
                         break;
                     }
                 }
+                dataChunk = nextChunk;
+                sampleIndex = 0;
+                chunkOffset ++;
             }
+
         }
 
+        this._dispatch = true;
         // dispatch parsed frames to consumer (typically, the remuxer)
         if (this._isInitialMetadataDispatched()) {
             if (this._dispatch && (this._audioTrack.length || this._videoTrack.length)) {
@@ -1100,7 +1134,14 @@ class MP4Demuxer {
             }
         }
 
-        return offset;  // consumed bytes, just equals latest offset index
+        //cache chunk and sample position info for next parse
+        this._lastChunkOffet = chunkOffset;
+        this._lastSampleIndex = sampleIndex;
+        this._proccessedByte = byteStart + offset;
+
+        // consumed bytes, just equals latest offset index 
+        // !! It MUST NOT be greater than chunk.byteLength otherwise iocontroller will give wrong data next time
+        return offset;    
     }
 
     _parseAVCVideoData(arrayBuffer, dataOffset, dataSize, tagTimestamp, tagPosition, frameType, cts, duration) {
