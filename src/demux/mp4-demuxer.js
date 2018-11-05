@@ -346,13 +346,16 @@ class MP4Demuxer {
                             */
                             body = new Uint8Array(data.buffer, data.byteOffset + index + offset + 8, box.size - 8);
                             let version = body[0];
-                            let boxOffset = version == 1 ? 24 : 16;
+                            let boxOffset = version == 1 ? 20 : 12;
+                            let timeScale = ReadBig32(body, boxOffset);
+                            boxOffset += 4;
                             let duration = (version == 1 ? ReadBig64 : ReadBig32)(body, boxOffset);
                             boxOffset += version == 1 ? 8 : 4;
                             let language = ReadBig16(body, boxOffset);
 
                             parent[box.name] = {
                                 version,
+                                timeScale,
                                 duration,
                                 language
                             };
