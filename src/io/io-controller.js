@@ -239,10 +239,10 @@ class IOController {
     _selectLoader() {
         if (this._isWebSocketURL) {
             this._loaderClass = WebSocketLoader;
-        } else if (FetchStreamLoader.isSupported()) {
-            this._loaderClass = FetchStreamLoader;
         } else if (MozChunkedLoader.isSupported()) {
             this._loaderClass = MozChunkedLoader;
+        } else if (FetchStreamLoader.isSupported()) {
+            this._loaderClass = FetchStreamLoader;
         } else if (RangeLoader.isSupported()) {
             this._loaderClass = RangeLoader;
         } else {
